@@ -513,6 +513,14 @@ def _init_state():
         snap = drive_load_all()
         if snap:
             _apply_snapshot(snap)
+        # Stocker le statut de diagnostic
+        fernet_ok = _get_fernet() is not None
+        nb_loaded  = len(st.session_state.get("db", {}))
+        st.session_state["_diag"] = {
+            "crypto": "✅ Fernet actif" if fernet_ok else "⚠️ Pas de chiffrement (JSON brut)",
+            "patients": nb_loaded,
+            "drive": "✅ Connecté" if _DRIVE_AVAILABLE else "❌ Drive indisponible",
+        }
 
     # ── Valeurs par défaut si Drive vide ou inaccessible ─────────
     if "users" not in st.session_state:
@@ -665,6 +673,17 @@ def render_sidebar():
         if current_role() == ROLE_ADMIN or current_user() == SUPER_ADMIN:
             st.markdown("<div style='border-top:1px solid #2A4F7F;margin:8px 0;'></div>", unsafe_allow_html=True)
             st.markdown("<div style='color:#4A6FA5;font-size:0.72rem;padding:4px 16px;font-weight:700;'>ADMIN</div>", unsafe_allow_html=True)
+        # Diagnostic technique (admin seulement)
+        diag = st.session_state.get("_diag", {})
+        if diag:
+            with st.expander("🔧 Diagnostic"):
+                st.caption(f"Crypto : {diag.get('crypto','?')}")
+                st.caption(f"Drive  : {diag.get('drive','?')}")
+                st.caption(f"Patients chargés : {diag.get('patients',0)}")
+                if diag.get('patients', 0) == 0:
+                    if st.button("🔄 Recharger depuis Drive", key="btn_reload_drive"):
+                        del st.session_state["drive_loaded"]
+                        st.rerun()
             if st.button("👥 Utilisateurs", use_container_width=True): st.session_state.page = "users";   st.rerun()
             if st.button("📝 Journal",      use_container_width=True): st.session_state.page = "journal"; st.rerun()
 
@@ -684,6 +703,8 @@ def render_header(subtitle=""):
     al   = sum(1 for p in db.values() if est_alerte(p.get("date_prog","")))
     eq   = current_equipe()
     col  = EQUIPES.get(eq, {}).get("couleur", "#1565C0")
+    alerte_badge = f'<span class="badge badge-red">⚠ {al} alertes</span>' if al else ''
+    equipe_label = f'Équipe {eq}' if eq else 'Admin'
     st.markdown(f"""
     <div class="surgix-header">
         <div style="font-size:2rem;">🏥</div>
@@ -693,9 +714,9 @@ def render_header(subtitle=""):
         </div>
         <div style="margin-left:auto; text-align:right;">
             <span class="badge badge-blue">{nb} patients</span>
-            {'<span class="badge badge-red">⚠ ' + str(al) + ' alertes</span>' if al else ''}
+            {alerte_badge}
             <span class="badge" style="background:{col}20;color:{col};">
-                {'Équipe ' + eq if eq else 'Admin'}
+                {equipe_label}
             </span>
         </div>
     </div>
