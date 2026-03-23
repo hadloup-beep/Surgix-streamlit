@@ -32,6 +32,70 @@ import json, hashlib, secrets, os, datetime, unicodedata, calendar
 from difflib import SequenceMatcher
 from datetime import date, timedelta
 
+# ═══════════════════════════════════════════════════════════════
+# CHIFFREMENT FERNET — compatible v1.12
+# ═══════════════════════════════════════════════════════════════
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    import base64
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
+
+@st.cache_resource
+def _get_fernet():
+    """
+    Dérive la clé Fernet depuis la clé stockée dans st.secrets.
+    Deux modes supportés :
+      - secrets["fernet_key"]   : clé Fernet brute en base64 (recommandé)
+      - secrets["crypto_password"] : mot de passe → dérivation PBKDF2 identique à v1.12
+    Si aucun secret n'est défini, retourne None (mode non-chiffré).
+    """
+    if not _CRYPTO_AVAILABLE:
+        return None
+    try:
+        # Mode 1 : clé Fernet directe (plus simple pour Streamlit Cloud)
+        if "fernet_key" in st.secrets:
+            return Fernet(st.secrets["fernet_key"].encode())
+        # Mode 2 : mot de passe → PBKDF2 (même algo que v1.12)
+        if "crypto_password" in st.secrets:
+            password = st.secrets["crypto_password"]
+            salt = b"SURGIX_CHU_OUJDA_2024"
+            kdf  = PBKDF2HMAC(
+                algorithm=hashes.SHA256(), length=32,
+                salt=salt, iterations=100_000
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            return Fernet(key)
+    except Exception:
+        pass
+    return None
+
+def _decrypt_bytes(raw: bytes) -> str:
+    """
+    Déchiffre des données brutes.
+    Essaie Fernet d'abord, puis fallback UTF-8 brut (fichiers non chiffrés).
+    """
+    fernet = _get_fernet()
+    if fernet and raw:
+        try:
+            return fernet.decrypt(raw).decode("utf-8")
+        except (InvalidToken, Exception):
+            pass  # Pas chiffré ou mauvaise clé → fallback
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return "{}"
+
+def _encrypt_str(data: str) -> bytes:
+    """Chiffre une chaîne. Si pas de Fernet configuré, encode en UTF-8 brut."""
+    fernet = _get_fernet()
+    if fernet:
+        return fernet.encrypt(data.encode("utf-8"))
+    return data.encode("utf-8")
+
 # ── Google Drive ────────────────────────────────────────────────────
 try:
     from google.oauth2 import service_account
@@ -83,7 +147,11 @@ def _find_file_id(svc, name: str) -> str:
         return ""
 
 def _drive_download_json(name: str) -> dict:
-    """Télécharge et parse un fichier JSON depuis Drive par son nom."""
+    """
+    Télécharge un fichier depuis Drive et le déchiffre si nécessaire.
+    Compatible avec les fichiers chiffrés Fernet de la v1.12
+    ET les anciens fichiers JSON bruts (v1.09).
+    """
     svc = _drive_service()
     if not svc:
         return {}
@@ -98,19 +166,26 @@ def _drive_download_json(name: str) -> dict:
         while not done:
             _, done = dl.next_chunk()
         buf.seek(0)
-        return json.loads(buf.read().decode("utf-8"))
+        raw = buf.read()
+        # _decrypt_bytes gère : Fernet chiffré OU JSON brut (rétrocompatible)
+        text = _decrypt_bytes(raw)
+        return json.loads(text)
     except Exception:
         return {}
 
 def _drive_upload_json(name: str, data):
-    """Uploade / met à jour un fichier JSON sur Drive par son nom."""
+    """
+    Chiffre et uploade un fichier JSON sur Drive.
+    Compatible v1.12 : chiffrement Fernet si configuré, JSON brut sinon.
+    """
     svc = _drive_service()
     if not svc:
         return
     try:
-        content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        media   = MediaIoBaseUpload(_io.BytesIO(content), mimetype="application/json")
-        fid     = _find_file_id(svc, name)
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+        raw      = _encrypt_str(json_str)
+        media    = MediaIoBaseUpload(_io.BytesIO(raw), mimetype="application/octet-stream")
+        fid      = _find_file_id(svc, name)
         if fid:
             svc.files().update(fileId=fid, media_body=media).execute()
         else:
