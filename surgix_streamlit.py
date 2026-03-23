@@ -32,9 +32,7 @@ import json, hashlib, secrets, os, datetime, unicodedata, calendar
 from difflib import SequenceMatcher
 from datetime import date, timedelta
 
-# ═══════════════════════════════════════════════════════════════
-# CHIFFREMENT FERNET — compatible v1.12
-# ═══════════════════════════════════════════════════════════════
+# ── Chiffrement Fernet (compatible v1.12 desktop) ───────────────────
 try:
     from cryptography.fernet import Fernet, InvalidToken
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -46,51 +44,37 @@ except ImportError:
 
 @st.cache_resource
 def _get_fernet():
-    """
-    Dérive la clé Fernet depuis la clé stockée dans st.secrets.
-    Deux modes supportés :
-      - secrets["fernet_key"]   : clé Fernet brute en base64 (recommandé)
-      - secrets["crypto_password"] : mot de passe → dérivation PBKDF2 identique à v1.12
-    Si aucun secret n'est défini, retourne None (mode non-chiffré).
-    """
     if not _CRYPTO_AVAILABLE:
         return None
     try:
-        # Mode 1 : clé Fernet directe (plus simple pour Streamlit Cloud)
         if "fernet_key" in st.secrets:
             return Fernet(st.secrets["fernet_key"].encode())
-        # Mode 2 : mot de passe → PBKDF2 (même algo que v1.12)
         if "crypto_password" in st.secrets:
             password = st.secrets["crypto_password"]
             salt = b"SURGIX_CHU_OUJDA_2024"
-            kdf  = PBKDF2HMAC(
-                algorithm=hashes.SHA256(), length=32,
-                salt=salt, iterations=100_000
-            )
-            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            kdf  = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                               salt=salt, iterations=100_000)
+            key  = base64.urlsafe_b64encode(kdf.derive(password.encode()))
             return Fernet(key)
     except Exception:
         pass
     return None
 
 def _decrypt_bytes(raw: bytes) -> str:
-    """
-    Déchiffre des données brutes.
-    Essaie Fernet d'abord, puis fallback UTF-8 brut (fichiers non chiffrés).
-    """
+    """Déchiffre Fernet si possible, sinon retourne UTF-8 brut (rétrocompat v1.09)."""
     fernet = _get_fernet()
     if fernet and raw:
         try:
             return fernet.decrypt(raw).decode("utf-8")
-        except (InvalidToken, Exception):
-            pass  # Pas chiffré ou mauvaise clé → fallback
+        except Exception:
+            pass
     try:
         return raw.decode("utf-8")
     except Exception:
         return "{}"
 
 def _encrypt_str(data: str) -> bytes:
-    """Chiffre une chaîne. Si pas de Fernet configuré, encode en UTF-8 brut."""
+    """Chiffre avec Fernet si configuré, sinon UTF-8 brut."""
     fernet = _get_fernet()
     if fernet:
         return fernet.encrypt(data.encode("utf-8"))
@@ -147,11 +131,7 @@ def _find_file_id(svc, name: str) -> str:
         return ""
 
 def _drive_download_json(name: str) -> dict:
-    """
-    Télécharge un fichier depuis Drive et le déchiffre si nécessaire.
-    Compatible avec les fichiers chiffrés Fernet de la v1.12
-    ET les anciens fichiers JSON bruts (v1.09).
-    """
+    """Télécharge et déchiffre un fichier JSON depuis Drive (compatible v1.12)."""
     svc = _drive_service()
     if not svc:
         return {}
@@ -166,18 +146,14 @@ def _drive_download_json(name: str) -> dict:
         while not done:
             _, done = dl.next_chunk()
         buf.seek(0)
-        raw = buf.read()
-        # _decrypt_bytes gère : Fernet chiffré OU JSON brut (rétrocompatible)
+        raw  = buf.read()
         text = _decrypt_bytes(raw)
         return json.loads(text)
     except Exception:
         return {}
 
 def _drive_upload_json(name: str, data):
-    """
-    Chiffre et uploade un fichier JSON sur Drive.
-    Compatible v1.12 : chiffrement Fernet si configuré, JSON brut sinon.
-    """
+    """Chiffre et uploade un fichier JSON sur Drive (compatible v1.12)."""
     svc = _drive_service()
     if not svc:
         return
@@ -513,14 +489,6 @@ def _init_state():
         snap = drive_load_all()
         if snap:
             _apply_snapshot(snap)
-        # Stocker le statut de diagnostic
-        fernet_ok = _get_fernet() is not None
-        nb_loaded  = len(st.session_state.get("db", {}))
-        st.session_state["_diag"] = {
-            "crypto": "✅ Fernet actif" if fernet_ok else "⚠️ Pas de chiffrement (JSON brut)",
-            "patients": nb_loaded,
-            "drive": "✅ Connecté" if _DRIVE_AVAILABLE else "❌ Drive indisponible",
-        }
 
     # ── Valeurs par défaut si Drive vide ou inaccessible ─────────
     if "users" not in st.session_state:
@@ -673,17 +641,6 @@ def render_sidebar():
         if current_role() == ROLE_ADMIN or current_user() == SUPER_ADMIN:
             st.markdown("<div style='border-top:1px solid #2A4F7F;margin:8px 0;'></div>", unsafe_allow_html=True)
             st.markdown("<div style='color:#4A6FA5;font-size:0.72rem;padding:4px 16px;font-weight:700;'>ADMIN</div>", unsafe_allow_html=True)
-        # Diagnostic technique (admin seulement)
-        diag = st.session_state.get("_diag", {})
-        if diag:
-            with st.expander("🔧 Diagnostic"):
-                st.caption(f"Crypto : {diag.get('crypto','?')}")
-                st.caption(f"Drive  : {diag.get('drive','?')}")
-                st.caption(f"Patients chargés : {diag.get('patients',0)}")
-                if diag.get('patients', 0) == 0:
-                    if st.button("🔄 Recharger depuis Drive", key="btn_reload_drive"):
-                        del st.session_state["drive_loaded"]
-                        st.rerun()
             if st.button("👥 Utilisateurs", use_container_width=True): st.session_state.page = "users";   st.rerun()
             if st.button("📝 Journal",      use_container_width=True): st.session_state.page = "journal"; st.rerun()
 
