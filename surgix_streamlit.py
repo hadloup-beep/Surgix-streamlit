@@ -2,17 +2,186 @@
 ╔══════════════════════════════════════════════════════════════════════╗
 ║   SURGIX v1.09 Sunrays — Version Streamlit (Cloud)                  ║
 ║   CHU Mohammed VI · Oujda · Service Ophtalmologie                   ║
-║   Sans générateur de documents Word                                  ║
+║   Stockage persistant : Google Drive — compatible version PC         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 Déploiement gratuit : https://streamlit.io/cloud
-Stockage :  st.session_state (session) + JSON local ou Drive optionnel
+
+Les fichiers Drive utilisés sont LES MÊMES que la version PC :
+  patients_A1.json / patients_B1.json / patients_B2.json / patients_A2.json
+  users.json  /  ttt_memory.json
+
+── Configuration requise (Streamlit Cloud > Secrets) ─────────────────
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN RSA PRIVATE KEY-----\\n...\\n-----END RSA PRIVATE KEY-----\\n"
+client_email = "surgix@...iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+──────────────────────────────────────────────────────────────────────
+
+⚠️  Partagez chaque fichier JSON Drive avec l'email du service account
+    (rôle Éditeur). Les fichiers sont détectés automatiquement par nom.
 """
 
 import streamlit as st
 import json, hashlib, secrets, os, datetime, unicodedata, calendar
 from difflib import SequenceMatcher
 from datetime import date, timedelta
+
+# ── Google Drive ────────────────────────────────────────────────────
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+    import io as _io
+    _DRIVE_AVAILABLE = True
+except ImportError:
+    _DRIVE_AVAILABLE = False
+
+# ═══════════════════════════════════════════════════════════════
+# COUCHE GOOGLE DRIVE — compatible fichiers version PC
+# ═══════════════════════════════════════════════════════════════
+_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# Noms de fichiers identiques à la version PC
+_DRIVE_FILES = {
+    "A1":   "patients_A1.json",
+    "B1":   "patients_B1.json",
+    "B2":   "patients_B2.json",
+    "A2":   "patients_A2.json",
+    "users": "users.json",
+    "ttt":   "ttt_memory.json",
+}
+
+@st.cache_resource
+def _drive_service():
+    """Retourne un client Drive authentifié via Service Account (mis en cache)."""
+    if not _DRIVE_AVAILABLE:
+        return None
+    try:
+        creds_info = dict(st.secrets["gcp_service_account"])
+        creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info, scopes=_DRIVE_SCOPES
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+def _find_file_id(svc, name: str) -> str:
+    """Cherche un fichier Drive par nom (comme la version PC)."""
+    try:
+        q   = f"name='{name}' and trashed=false"
+        res = svc.files().list(q=q, fields="files(id)", pageSize=5).execute()
+        files = res.get("files", [])
+        return files[0]["id"] if files else ""
+    except Exception:
+        return ""
+
+def _drive_download_json(name: str) -> dict:
+    """Télécharge et parse un fichier JSON depuis Drive par son nom."""
+    svc = _drive_service()
+    if not svc:
+        return {}
+    try:
+        fid = _find_file_id(svc, name)
+        if not fid:
+            return {}
+        req = svc.files().get_media(fileId=fid)
+        buf = _io.BytesIO()
+        dl  = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        buf.seek(0)
+        return json.loads(buf.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+def _drive_upload_json(name: str, data):
+    """Uploade / met à jour un fichier JSON sur Drive par son nom."""
+    svc = _drive_service()
+    if not svc:
+        return
+    try:
+        content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        media   = MediaIoBaseUpload(_io.BytesIO(content), mimetype="application/json")
+        fid     = _find_file_id(svc, name)
+        if fid:
+            svc.files().update(fileId=fid, media_body=media).execute()
+        else:
+            svc.files().create(
+                body={"name": name}, media_body=media, fields="id"
+            ).execute()
+    except Exception:
+        pass  # Silencieux — ne jamais bloquer l'interface
+
+def drive_load_all() -> dict:
+    """
+    Charge tous les fichiers depuis Drive et retourne un snapshot complet.
+    Compatible avec la structure de fichiers de la version PC.
+    """
+    db = {}
+    for eq in ["A1", "B1", "B2", "A2"]:
+        eq_data = _drive_download_json(_DRIVE_FILES[eq])
+        if isinstance(eq_data, dict):
+            db.update(eq_data)
+    return {
+        "db":    db,
+        "users": _drive_download_json(_DRIVE_FILES["users"]),
+        "ttt":   _drive_download_json(_DRIVE_FILES["ttt"]),
+    }
+
+def drive_save_patients():
+    """
+    Sauvegarde les patients sur Drive en respectant la séparation par équipe
+    (identique à la version PC : patients_A1.json, patients_B1.json, etc.)
+    """
+    db = st.session_state.get("db", {})
+    # Répartition par équipe
+    buckets = {"A1": {}, "B1": {}, "B2": {}, "A2": {}, "admin": {}}
+    eq_membres = {
+        "A1": ["ACHERGUI","HALHOUL","LABYAD","BOUTAIB","JABRI","MOUSSA","HEYOUNI"],
+        "B1": ["HIDA","OUSMANE","NOUR","ELMEHDI","KOUEUI","DJIRE"],
+        "B2": ["SKIKER","NADO","HAMDI","BOULAGHCHA","HABOUCHA","BOUCHAREB","BENALI","ELHACHEMI"],
+        "A2": ["BADI","DHAOUI","YAMANI","MOHAMMEDHASSAN","SERJI","CHEIKH","TIJANIH","ELHADDI","ELMASSRI"],
+    }
+    for ip, patient in db.items():
+        medecin = patient.get("medecin", "")
+        placed  = False
+        for eq, membres in eq_membres.items():
+            # On cherche si le médecin traitant appartient à cette équipe
+            for m in membres:
+                if m.lower() in medecin.lower():
+                    buckets[eq][ip] = patient
+                    placed = True
+                    break
+            if placed:
+                break
+        if not placed:
+            buckets["admin"][ip] = patient
+    # Upload de chaque bucket
+    for eq in ["A1", "B1", "B2", "A2"]:
+        _drive_upload_json(_DRIVE_FILES[eq], buckets[eq])
+
+def drive_save_users():
+    _drive_upload_json(_DRIVE_FILES["users"], st.session_state.get("users", {}))
+
+def drive_save_ttt():
+    _drive_upload_json(_DRIVE_FILES["ttt"], st.session_state.get("ttt_fiches", []))
+
+def _apply_snapshot(snap: dict):
+    """Injecte les données chargées depuis Drive dans session_state."""
+    if snap.get("db"):
+        st.session_state.db = snap["db"]
+    if snap.get("users"):
+        st.session_state.users = snap["users"]
+    if snap.get("ttt"):
+        st.session_state.ttt_fiches = snap["ttt"]
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIGURATION PAGE
@@ -263,6 +432,14 @@ def nouveau_patient(ip, nom, prenom, age="", equipe=""):
 # STOCKAGE SESSION STATE (base patients + users en mémoire)
 # ═══════════════════════════════════════════════════════════════
 def _init_state():
+    # ── Chargement Drive une seule fois par session ──────────────
+    if "drive_loaded" not in st.session_state:
+        st.session_state.drive_loaded = True
+        snap = drive_load_all()
+        if snap:
+            _apply_snapshot(snap)
+
+    # ── Valeurs par défaut si Drive vide ou inaccessible ─────────
     if "users" not in st.session_state:
         users = {}
         for login, pw, role, nom in COMPTES_DEFAUT:
@@ -271,10 +448,10 @@ def _init_state():
         st.session_state.users = users
 
     if "db" not in st.session_state:
-        st.session_state.db = {}   # ip → patient dict
+        st.session_state.db = {}           # ip → patient dict
 
     if "logged_in" not in st.session_state:
-        st.session_state.logged_in   = False
+        st.session_state.logged_in    = False
         st.session_state.current_user = None
 
     if "page" not in st.session_state:
@@ -295,6 +472,9 @@ def _init_state():
     if "edit_ip" not in st.session_state:
         st.session_state.edit_ip = None
 
+    if "_drive_save_counter" not in st.session_state:
+        st.session_state._drive_save_counter = 0
+
 _init_state()
 
 def log_action(user, action, detail=""):
@@ -312,6 +492,7 @@ def get_db():
 def save_patient(patient):
     ip = patient["ip"]
     st.session_state.db[ip] = patient
+    drive_save_patients()  # Sauvegarde immédiate dans le bon fichier d'équipe
 
 def current_user():  return st.session_state.current_user
 def current_nom():
@@ -719,6 +900,7 @@ def page_edit_patient():
         if st.checkbox("Je veux supprimer ce patient"):
             if st.button("🗑 Supprimer définitivement", type="primary"):
                 del st.session_state.db[ip]
+                drive_save_patients()
                 log_action(current_user(), "SUPPRESSION", f"IP {ip}")
                 st.session_state.page = "patients"; st.rerun()
 
@@ -1255,6 +1437,7 @@ def page_users():
         else:
             h, s = _hash(r_pw)
             users[r_login]["hash"] = h; users[r_login]["salt"] = s
+            drive_save_users()
             log_action(current_user(), "RESET MDP", r_login)
             st.success(f"✅ MDP de {r_login} réinitialisé.")
 
@@ -1275,6 +1458,7 @@ def page_users():
         else:
             h, s = _hash(new_pw)
             u["hash"] = h; u["salt"] = s
+            drive_save_users()
             log_action(current_user(), "CHANGEMENT MDP", current_user())
             st.success("✅ Mot de passe modifié.")
 
